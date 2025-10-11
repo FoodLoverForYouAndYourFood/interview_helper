@@ -439,7 +439,7 @@ async def handle_answer_callback(callback: CallbackQuery) -> None:
         await callback.answer("Сессия не активна", show_alert=True)
         return
 
-    parts = callback.data.split(":")
+    parts = callback.data.split(":") # type: ignore
     if len(parts) != 4:
         await callback.answer()
         return
@@ -462,11 +462,11 @@ async def handle_answer_callback(callback: CallbackQuery) -> None:
         await callback.answer("Этот вопрос уже закрыт", show_alert=True)
         return
 
-    processed, gained = await _handle_mcq_answer(callback.message, state, question, choice_index, via_callback=True)
+    processed, gained = await _handle_mcq_answer(callback.message, state, question, choice_index, via_callback=True) # type: ignore
     if not processed:
         await callback.answer("Некорректный вариант", show_alert=True)
         return
 
     await callback.answer()
     correct_count = state.get("correct", 0) + gained
-    await _advance_after_answer(callback.message, user_id, state, correct_count)
+    await _advance_after_answer(callback.message, user_id, state, correct_count) # type: ignore
