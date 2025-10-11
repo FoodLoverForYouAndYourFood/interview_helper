@@ -10,7 +10,7 @@ class Config:
     openai_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     required_channel: str = os.getenv("REQUIRED_CHANNEL", "@BigFrinedlyCat")
-    admins: set[int] = None
+    admins: set[int] = None # type: ignore
     default_session_n: int = int(os.getenv("DEFAULT_SESSION_N", "5"))
 
     def __post_init__(self):
