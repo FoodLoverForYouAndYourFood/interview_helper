@@ -4,9 +4,10 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Iterable
+from io import BytesIO
 
 import aiosqlite
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -24,6 +25,149 @@ class QuestionPayload:
     options: list[str] | None
     correct_index: int | None
     ideal_answer: str | None
+    topic_level: str | None = None
+
+
+
+_VALID_TOPIC_LEVELS: set[str] = {"basic", "advanced"}
+
+
+
+def _coerce_optional_level(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if not value:
+        return None
+    if value in _VALID_TOPIC_LEVELS:
+        return value
+    raise ValueError(f"Некорректный уровень темы: {raw}")
+
+
+def _normalize_level(raw: str | None, *, default: str = "basic") -> str:
+    level = _coerce_optional_level(raw)
+    if level is None:
+        return default
+    return level
+
+
+def _parse_topic_command_payload(raw: str) -> tuple[str, str]:
+    payload = raw.strip()
+    if not payload:
+        raise ValueError("Формат: /add_topic <basic|advanced> | <название темы>.")
+    if "|" in payload:
+        level_raw, title = [part.strip() for part in payload.split("|", 1)]
+        if not title:
+            raise ValueError("Название темы обязательно.")
+        level = _normalize_level(level_raw)
+        return title, level
+    title, level_hint = _split_topic_and_level(payload)
+    return title.strip(), level_hint or "basic"
+
+
+def _split_topic_and_level(raw: str) -> tuple[str, str | None]:
+    candidate = raw.strip()
+    for sep in ("|", "@"):
+        if sep in candidate:
+            base, level_raw = [part.strip() for part in candidate.rsplit(sep, 1)]
+            if not base:
+                continue
+            level = _coerce_optional_level(level_raw)
+            if level is not None:
+                return base, level
+    if candidate.endswith(")") and "(" in candidate:
+        base, level_raw = candidate.rsplit("(", 1)
+        level_raw = level_raw.rstrip(")")
+        level = _coerce_optional_level(level_raw)
+        if level is not None and base.strip():
+            return base.strip(), level
+    return candidate, None
+
+def _command_arguments(source: str | None, command: str) -> str:
+    if not source:
+        return ""
+    cleaned = source.strip()
+    if cleaned.startswith(command):
+        cleaned = cleaned[len(command):]
+    return cleaned.strip()
+
+
+def _parse_import_mode(raw: str | None) -> bool:
+    tokens = (raw or "").lower().split()
+    if not tokens:
+        return True
+    head = tokens[0]
+    if head in {"append", "merge", "extend"}:
+        return False
+    if head in {"replace", "reset"}:
+        return True
+    return True
+
+
+def _load_topics_payload(raw: str) -> tuple[list[dict[str, Any]], bool | None]:
+    data = json.loads(raw)
+    replace: bool | None = None
+    if isinstance(data, dict):
+        topics = data.get("topics")
+        if not isinstance(topics, list):
+            raise ValueError("В корне JSON ожидается ключ 'topics' со списком тем.")
+        if "replace" in data:
+            replace = bool(data.get("replace"))
+    elif isinstance(data, list):
+        topics = data
+    else:
+        raise ValueError("JSON должен описывать список тем или объект с ключом 'topics'.")
+    return topics, replace
+
+
+async def _handle_import_file(message: Message, *, replace_default: bool) -> None:
+    document = message.document
+    if not document:
+        await message.answer(
+            "Прикрепите JSON-файл с вопросами и отправьте команду /import_q в подписи к файлу.\n"
+            "Формат файла: {\"topics\": [...]} или просто список тем."
+        )
+        return
+    if document.file_name and not document.file_name.lower().endswith(".json"):
+        await message.answer("Ожидается JSON-файл с расширением .json.")
+        return
+    buffer = BytesIO()
+    await message.bot.download(document, destination=buffer)  # type: ignore[arg-type]
+    try:
+        raw = buffer.getvalue().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        await message.answer("Не получилось прочитать файл: используйте кодировку UTF-8.")
+        return
+
+    try:
+        topics, replace_in_file = _load_topics_payload(raw)
+    except ValueError as exc:
+        await message.answer(f"Не удалось разобрать файл: {exc}")
+        return
+    except json.JSONDecodeError as exc:
+        await message.answer(f"Ошибка JSON: {exc}")
+        return
+
+    replace_flag = replace_in_file if replace_in_file is not None else replace_default
+
+    try:
+        stats = await db.import_topics_from_payload(topics, replace_default=replace_flag)
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
+
+    mode_text = "перезапись существующих вопросов" if replace_flag else "добавление без удаления"
+    summary = [
+        "Импорт завершён.",
+        f"• Тем добавлено: {stats['topics_created']}",
+        f"• Тем обновлено: {stats['topics_updated']}",
+        f"• Вопросов сохранено: {stats['questions_added']}",
+    ]
+    if stats['questions_skipped']:
+        summary.append(f"• Пропущено из-за совпадений: {stats['questions_skipped']}")
+    summary.append(f"Режим: {mode_text}.")
+
+    await message.answer("\n".join(summary))
 
 
 def _is_admin(message: Message) -> bool:
@@ -44,12 +188,17 @@ async def _fetch_single(conn: aiosqlite.Connection, query: str, *params: Any) ->
     return row[0] if row else None
 
 
-async def _topic_exists(conn: aiosqlite.Connection, title: str) -> bool:
-    result = await _fetch_single(conn, "SELECT 1 FROM topics WHERE title=?", title)
+async def _topic_exists(conn: aiosqlite.Connection, title: str, level: str | None = None) -> bool:
+    if level:
+        result = await _fetch_single(conn, "SELECT 1 FROM topics WHERE title=? AND level=?", title, level)
+    else:
+        result = await _fetch_single(conn, "SELECT 1 FROM topics WHERE title=?", title)
     return result is not None
 
 
-async def _resolve_topic_id(conn: aiosqlite.Connection, title: str) -> int | None:
+async def _resolve_topic_id(conn: aiosqlite.Connection, title: str, level: str | None = None) -> int | None:
+    if level:
+        return await _fetch_single(conn, "SELECT id FROM topics WHERE title=? AND level=?", title, level)
     return await _fetch_single(conn, "SELECT id FROM topics WHERE title=?", title)
 
 
@@ -79,6 +228,7 @@ def _parse_question_payload(message: Message) -> QuestionPayload:
             "Неверный формат. Используйте: /add_q <тема> | <mcq|open> | <текст> | <варианты или -> | <номер или -> | <идеал или ->"
         )
     topic_title, qtype, text_q, options_raw, correct_raw, ideal_raw = parts[:6]
+    topic_title, topic_level = _split_topic_and_level(topic_title)
     if not topic_title:
         raise ValueError("Название темы обязательно.")
     qtype = qtype.lower()
@@ -124,34 +274,63 @@ def _parse_question_payload(message: Message) -> QuestionPayload:
         options=options,
         correct_index=correct_index,
         ideal_answer=ideal_answer,
+        topic_level=topic_level,
     )
 
 
-def _format_top_topics(rows: Iterable[tuple[str, int]]) -> list[str]:
+def _format_top_topics(rows: Iterable[tuple[str, str, int]]) -> list[str]:
     lines: list[str] = []
-    for idx, (title, count) in enumerate(rows, start=1):
-        lines.append(f"{idx}. {title} — {count}")
+    for idx, (title, level, count) in enumerate(rows, start=1):
+        lines.append(f"{idx}. {title} ({level}) — {count}")
     return lines
+
+
+@router.message(Command("import_q"))
+async def import_q(message: Message) -> None:
+    if not await _ensure_admin(message):
+        return
+    args = _command_arguments(message.text, "/import_q")
+    replace_default = _parse_import_mode(args)
+    if not message.document:
+        await message.answer(
+            "Прикрепите JSON-файл с вопросами и отправьте команду /import_q в подписи к файлу.\n"
+            "Используйте '/import_q append', чтобы добавить вопросы без удаления существующих."
+        )
+        return
+    await _handle_import_file(message, replace_default=replace_default)
+
+
+@router.message(F.document, F.caption, F.caption.startswith("/import_q"))
+async def import_q_document(message: Message) -> None:
+    if not await _ensure_admin(message):
+        return
+    args = _command_arguments(message.caption, "/import_q")
+    replace_default = _parse_import_mode(args)
+    await _handle_import_file(message, replace_default=replace_default)
 
 
 @router.message(Command("add_topic"))
 async def add_topic(message: Message) -> None:
     if not await _ensure_admin(message):
         return
-    text = (message.text or "").split(maxsplit=1)
-    if len(text) < 2 or not text[1].strip():
-        await message.answer("Формат: /add_topic <название темы>")
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Формат: /add_topic <basic|advanced> | <название темы>")
         return
-    title = text[1].strip()
+    try:
+        title, level = _parse_topic_command_payload(parts[1])
+    except ValueError as exc:
+        await message.answer(str(exc))
+        return
 
     async with aiosqlite.connect(db.path) as conn:
-        exists = await _topic_exists(conn, title)
+        exists = await _topic_exists(conn, title, level)
         if exists:
-            await message.answer(f"Тема «{title}» уже есть в базе.")
+            await message.answer(f"Тема «{title}» с уровнем {level} уже есть в базе.")
             return
-        await conn.execute("INSERT INTO topics(title) VALUES(?)", (title,))
+        await conn.execute("INSERT INTO topics(title, level, active) VALUES(?,?,1)", (title, level))
         await conn.commit()
-    await message.answer(f"Тема «{title}» успешно добавлена и активирована.")
+    await message.answer(f"Тема «{title}» ({level}) успешно добавлена и активирована.")
 
 
 @router.message(Command("add_q"))
@@ -165,10 +344,11 @@ async def add_q(message: Message) -> None:
         return
 
     async with aiosqlite.connect(db.path) as conn:
-        topic_id = await _resolve_topic_id(conn, payload.topic_title)
+        topic_id = await _resolve_topic_id(conn, payload.topic_title, payload.topic_level)
+        level_note = f" (уровень {payload.topic_level})" if payload.topic_level else ""
         if topic_id is None:
             await message.answer(
-                "Тема не найдена. Добавьте её командой /add_topic или убедитесь в правильности названия."
+                f"Тема «{payload.topic_title}»{level_note} не найдена. Добавьте её командой /add_topic."
             )
             return
         await conn.execute(
@@ -184,8 +364,10 @@ async def add_q(message: Message) -> None:
         )
         await conn.commit()
 
+
     summary = [
         "Вопрос добавлен:",
+        f"• Уровень: {payload.topic_level or 'basic'}",
         f"• Тема: {payload.topic_title}",
         f"• Тип: {payload.qtype}",
         f"• Текст: {payload.text}",
@@ -222,10 +404,10 @@ async def stats(message: Message) -> None:
         last_session = await _fetch_single(conn, "SELECT MAX(started_at) FROM sessions")
         last_answer = await _fetch_single(conn, "SELECT MAX(answered_at) FROM answers")
 
-        top_topics: list[tuple[str, int]] = []
+        top_topics: list[tuple[str, str, int]] = []
         async with conn.execute(
             """
-            SELECT t.title, COUNT(*) AS cnt
+            SELECT t.title, t.level, COUNT(*) AS cnt
             FROM questions q
             JOIN topics t ON t.id = q.topic_id
             GROUP BY t.id
@@ -233,8 +415,8 @@ async def stats(message: Message) -> None:
             LIMIT 5
             """
         ) as cur:
-            async for title, cnt in cur:
-                top_topics.append((title, cnt))
+            async for title, level, cnt in cur:
+                top_topics.append((title, level, cnt))
 
     accuracy = (answers_correct / answers_total * 100) if answers_total else 0.0
 
